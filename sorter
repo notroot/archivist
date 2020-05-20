@@ -4,13 +4,23 @@ import os, sys, argparse, shutil
 from os import path
 import re
 import EXIF
+import hashlib
+
 
 supported_extentions = ['.jpg', '.jpeg']
 counter = {}
 counter['exif'] = 0
 counter['copied'] = 0
-counter['unknown'] = 0 
+counter['unknown'] = 0
 
+def sha1File(fpath):
+    sha = hashlib.sha1()
+    with open(fpath, 'rb') as f:
+        while True:
+            chunk = f.read(2**10)
+            if not chunk: break
+            sha.update(chunk)
+        return sha.hexdigest()
 
 def DateStringFromExif(Filename):
     if Filename == '':
@@ -59,7 +69,7 @@ def DateInfoFromExif(file_name):
 def cmpExif(src, dst):
     if src == '' or dst == '':
         return False
-    
+
     if not path.exists(src) or not path.exists(dst):
         return False
 
@@ -85,7 +95,7 @@ def cmpExif(src, dst):
                 src_value = "%s" % src_tags[tag]
             except TypeError:
                 continue
-            
+
             if not tag in dst_tags:
                 return False
             try:
@@ -102,10 +112,10 @@ def cmpExif(src, dst):
     return True
 
 
-def copyFileExif(src_path, exif):
+def copyFileExif(src_path, exif, dry_run=False):
     #dst_path = "%s/%s" % (dst_dir,dst_name)
     date_dir = "%s/%s/%s" % (dst_dir, exif['year'], exif['month'])
-    if not path.exists(date_dir):
+    if not path.exists(date_dir) and not dry_run:
         os.makedirs(date_dir)
 
     dst_fname = "IMG_%s%s%s_%s.jpg" % (exif['year'],exif['month'],exif['day'],exif['time'])
@@ -116,49 +126,66 @@ def copyFileExif(src_path, exif):
 
         #print "duplicate found at %s (%s)" % (dst_path, src_path)
         if not cmpExif(src_path, dst_path):
-            n = 1  
+            n = 1
             found = False
             while path.exists(dst_path):
-                dst_fname = "IMG_%s%s%s_%s-%s.jpg" % (exif['year'],exif['month'],exif['day'],exif['time'], n)
+                dst_fname = "IMG_%s%s%s_%s-%s.jpg" % (exif['year'], exif['month'], exif['day'], exif['time'], n)
                 dst_path = "%s/%s" % (date_dir, dst_fname)
                 n += 1
-                
+
                 if cmpExif(src_path, dst_path):
                     found = True
                     break
-    
+
             if not found:
                 print "copying %s to %s" % (src_path, dst_path)
-                shutil.copy(src_path,dst_path)
+                if not dry_run:
+                    shutil.copy(src_path, dst_path)
                 counter['copied'] += 1
     else:
         print "copying %s to %s" % (src_path, dst_path)
-        shutil.copy(src_path,dst_path)
+        if not dry_run:
+            shutil.copy(src_path, dst_path)
         counter['copied'] += 1
 
-    return 0 
+    return 0
 
-def copyFileToFolder(src_path, fname, folder):
+def copyFileToFolder(src_path, fname, folder, dry_run=False):
     to_folder = "%s/%s" % (dst_dir, folder)
-    if not path.exists(to_folder):
+    if not path.exists(to_folder) and not dry_run:
         os.makedirs(to_folder)
 
     dst_path = "%s/%s/%s" % (dst_dir, folder, fname)
     n = 1
-    while path.exists(dst_path):
-        base, ext = path.splitext(fname)
-        fname = "%s-%s.%s" % (base, n, ext)
-        dst_path = "%s/%s/%s" % (dst_dir, folder, fname)
-        n += 1
 
-    shutil.copy(src_path, dst_path)
+    if path.exists(dst_path):
+        dst_sha1 = sha1File(dst_path)
+        src_sha1 = sha1File(src_path)
+
+        if dst_sha1 == src_sha1:
+            print ("SHA1 match, skipping copy (%s & %s)" % (src_path, dst_path))
+            return 0
+        else:
+
+            while path.exists(dst_path):
+                base, ext = path.splitext(fname)
+                fname = "%s-%s.%s" % (base, n, ext)
+                dst_path = "%s/%s/%s" % (dst_dir, folder, fname)
+                n += 1
+
+    if not dry_run:
+        shutil.copy(src_path, dst_path)
+
     counter['copied'] += 1
+
+    return 0
 
 
 parser = argparse.ArgumentParser(description='Sorts photos based on EXIF info into new directory')
 parser.add_argument("--src", help="sorce directory", required=True)
 parser.add_argument("--dst", help="destination directory", required=True)
 parser.add_argument("--skip-duplicates", help="skip source file if same time found in destination, faster but less complete", action="store_true")
+parser.add_argument("--dry-run", "-d", help="dry run", action="store_true")
 args = parser.parse_args()
 
 #print args.src
@@ -190,6 +217,9 @@ if args.skip_duplicates:
 else:
     skip_dups = False
 
+dry_run = False
+if args.dry_run:
+    dry_run = True
 
 #os.walk(src_dir)
 for root, dirs, files in os.walk(src_dir):
@@ -206,13 +236,13 @@ for root, dirs, files in os.walk(src_dir):
 
             if exif:
                 #print "would copy"
-                copyFileExif(fpath, exif)
+                copyFileExif(fpath, exif, dry_run=dry_run)
                 counter['exif'] += 1
             elif re.match('^PANO.*', base):
-                copyFileToFolder(fpath, fname, "Pano")
+                copyFileToFolder(fpath, fname, "Pano", dry_run=dry_run)
             else:
                 print "Picture has no EXIF data: %s" % fpath
-                copyFileToFolder(fpath, fname, "Unkown")
+                copyFileToFolder(fpath, fname, "Unkown", dry_run=dry_run)
                 counter['unknown'] += 1
 
 print "Pictures with exif: %s" % counter['exif']
