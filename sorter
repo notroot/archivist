@@ -1,250 +1,268 @@
-#!/usr/bin/python
-
-import os, sys, argparse, shutil
-from os import path
-import re
-import EXIF
+#!env python3
+from datetime import datetime
+from exif import Image
+import argparse
 import hashlib
+import os
+import re
+import shutil
 
 
-supported_extentions = ['.jpg', '.jpeg']
-counter = {}
-counter['exif'] = 0
-counter['copied'] = 0
-counter['unknown'] = 0
+class SourceError(Exception):
+    def __init__(self, message):
+        self.message = message
 
-def sha1File(fpath):
-    sha = hashlib.sha1()
-    with open(fpath, 'rb') as f:
-        while True:
-            chunk = f.read(2**10)
-            if not chunk: break
-            sha.update(chunk)
+    def __str__(self):
+        return "Error with source file or directory: %" % self.message
+
+
+class FoundDuplicate(Exception):
+    def __init__(self, src, dest):
+        self.src = src
+        self.dest = dest
+        self.message = "%s is a duplicate of %s" % (src, dest)
+
+    def __str__(self):
+        return "Error with source file or directory: %" % self.message
+
+
+class Archivist:
+    def __init__(self, dest_dir, dry_run=True, skip_dups=False):
+
+        self.dest_dir = dest_dir
+        self.dry_run = dry_run
+        self.skip_dups = skip_dups
+
+        self.supported_extentions = ['.jpg', '.jpeg']
+        self.counter = {}
+        self.counter['exif'] = 0
+        self.counter['copied'] = 0
+        self.counter['unknown'] = 0
+
+    def process_directory(self, src_dir, dry_run=True):
+        """ primary function for Archivist class. Walks through a source directory of images and
+        coppies them out into a new directory into folders by year/month.
+        """
+
+        if not os.path.isdir(src_dir):
+            raise(SourceError("Cannot locate source directory %s" % src_dir))
+
+        for root, dirs, files in os.walk(src_dir):
+            for fname in files:
+                base, ext = os.path.splitext(fname)
+                ext = ext.lower()
+
+                if ext in self.supported_extentions:
+                    fpath = os.path.join(root, fname)
+                    exif_datetime = self.dateInfoFromExif(fpath)
+
+                    if exif_datetime:
+                        self.counter['exif'] += 1
+                        try:
+                            self.copyFileExif(fpath, exif_datetime)
+                        except FoundDuplicate:
+                            continue
+                    elif re.match('^PANO.*', base):
+                        self.copyFileToFolder(fpath, fname, "Pano")
+                    else:
+                        print("Picture has no EXIF data: %s" % fpath)
+                        self.copyFileToFolder(fpath, fname, "Unkown")
+                        self.counter['unknown'] += 1
+
+        print("Pictures with exif: %s" % self.counter['exif'])
+        print("Pictures w/o exif: %s" % self.counter['unknown'])
+        print("Pictures copied: %s" % self.counter['copied'])
+
+    def dateInfoFromExif(self, file_path):
+        """ Extract a datetime object from the exif data of the file if possible. """
+        if not os.path.isfile(file_path):
+            return None
+        datestamp = None
+
+        with open(file_path, 'rb') as fh:
+            try:
+                exif_data = Image(fh)
+            except AssertionError:
+                # library sometimes throws errors on EXIF data that is improperly formatted
+                # haven't actually run into it on any from my photos so just ignoring it
+                return None
+            except ValueError:
+                # error from invalid EXIF data
+                return None
+
+        if not exif_data.has_exif:
+            return None
+
+        if hasattr(exif_data, 'datetime_original'):
+            if exif_data.datetime_original == "0000:00:00 00:00:00":
+                return None
+
+            try:
+                # some exif has / between parts of the date
+                if "/" in exif_data.datetime_original:
+                    datestamp = datetime.strptime(exif_data.datetime_original, "%Y/%m/%d %H:%M:%S")
+                else:
+                    # '2019:11:28 16:17:25' for most EXIF
+                    datestamp = datetime.strptime(exif_data.datetime_original, "%Y:%m:%d %H:%M:%S")
+            except ValueError as e:
+                print("Unable to convert exif time string to datetime object: %s" % exif_data.datetime_original)
+                raise(ValueError(e))
+
+        return datestamp
+
+    def cmpExif(self, src, dest):
+        """
+        compare two files by checking if the EXIF data matches. Finds duplicate images that might have different names
+        """
+        if not os.path.isfile(src) or not os.path.isfile(dest):
+            return False
+
+        with open(src, 'rb') as src_fh:
+            src_exif = Image(src_fh)
+        if not src_exif:
+            return False
+
+        with open(src, 'rb') as src_fh:
+            dest_exif = Image(src_fh)
+        if not dest_exif:
+            return False
+
+        tags_to_check = ["datetime_original", "subsec_time_original", "model", "x_resolution", "y_resolution"]
+        tested_anything = False  # make sure that we test at least one of the listed tags
+
+        for tag in tags_to_check:
+            # get the specific EXIF value out of the source, if missing move on to the next value
+            try:
+                src_value = getattr(src_exif, tag)
+            except AttributeError:
+                continue
+
+            # get the same tag out of the dest, except if its missing this time error
+            try:
+                dest_value = getattr(dest_exif, tag)
+            except AttributeError:
+                return False
+
+            if not src_value == dest_value:
+                print("Src Key: %s; value: %s" % (tag, src_value))
+                print("Dst Key: %s; value: %s" % (tag, dest_value))
+                print("----------------------------------------------")
+                return False
+            else:
+                tested_anything = True
+
+        if tested_anything:
+            return True
+        else:
+            # TODO: raise an error here
+            print("Unable to find EXIF values for comparison, this is a real issue you should look into")
+            # return false because we didn't find any exif data to compare
+            return False
+
+    def copyFileExif(self, src_path, exif_datetime):
+        """ Copy source file into proper date directory based on its EXIF data """
+
+        # create the year/month directory if it doesn't exist unless dry_run
+        image_year = exif_datetime.strftime("%Y")
+        image_month = exif_datetime.strftime("%m")
+        date_dir = os.path.join(self.dest_dir, image_year, image_month)
+        if not os.path.exists(date_dir) and not self.dry_run:
+            os.makedirs(date_dir)
+
+        datestamp_str = exif_datetime.strftime("%Y%m%d_%H%M%S")
+        dest_fname = "IMG_%s.jpg" % (datestamp_str)
+        dest_path = os.path.join(date_dir, dest_fname)
+        if os.path.exists(dest_path):
+            if self.skip_dups:
+                # running with duplicate checking disabled for speedup, assuming duplicate filename is good enough
+                raise(FoundDuplicate(src_path, dest_path))
+
+            # file with same datestamp at destination path already exists, checking to see if EXIF data matches src
+            if not self.cmpExif(src_path, dest_path):
+                # EXIF data doesn't match, means its likely a different photo from the same time, copy with a -n added to the name
+                n = 1
+                while os.path.exists(dest_path):
+                    dest_fname = "IMG_%s-%s.jpg" % (datestamp_str, n)
+                    dest_path = os.path.join(date_dir, dest_fname)
+                    n += 1
+
+                    if self.cmpExif(src_path, dest_path):
+                        # EXIF for source and destination look similar
+                        # looks like we've already coppied it to a -n number so we can skip it
+                        raise(FoundDuplicate(src_path, dest_path))
+            else:
+                raise(FoundDuplicate(src_path, dest_path))
+
+        print("copying %s to %s" % (src_path, dest_path))
+        if not self.dry_run:
+            shutil.copy(src_path, dest_path)
+        self.counter['copied'] += 1
+
+        return 0
+
+    def copyFileToFolder(self, src_path, fname, folder):
+        """
+        Generic function for copying an image to a specific folder,
+        used for special files that have no EXIF or files that can't be parsed
+        """
+
+        to_folder = os.path.join(self.dest_dir, folder)
+        if not os.path.exists(to_folder) and not self.dry_run:
+            os.makedirs(to_folder)
+
+        dest_path = os.path.join(self.dest_dir, folder, fname)
+        n = 1
+
+        if os.path.exists(dest_path):
+            dest_sha1 = self.__sha1File(dest_path)
+            src_sha1 = self.__sha1File(src_path)
+
+            if dest_sha1 == src_sha1:
+                print(("SHA1 match, skipping copy (%s & %s)" % (src_path, dest_path)))
+                return 0
+            else:
+                while os.path.exists(dest_path):
+                    base, ext = os.path.splitext(fname)
+                    fname = "%s-%s.%s" % (base, n, ext)
+                    dest_path = os.path.join(self.dest_dir, folder, fname)
+                    n += 1
+
+        if not self.dry_run:
+            shutil.copy(src_path, dest_path)
+
+        self.counter['copied'] += 1
+
+        return 0
+
+    def __sha1File(self, fpath):
+        """ simple helper function to generate a sha1sum of a file by path """
+        sha = hashlib.sha1()
+        with open(fpath, 'rb') as f:
+            while True:
+                chunk = f.read(2**10)
+                if not chunk:
+                    break
+                sha.update(chunk)
+
         return sha.hexdigest()
 
-def DateStringFromExif(Filename):
-    if Filename == '':
-        return None
 
-    f = open(Filename, 'rb')
-    tags = EXIF.process_file(f, debug=0)
-    #for tag in tags.keys(): #Check tags
-    #    if tag not in ['JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote']:
-    #        if tag == 'EXIF DateTimeOriginal':
-    #            print "Key: %s; value: %s" % (tag, tags[tag])
+# Main
+def main():
+    parser = argparse.ArgumentParser(description='Sorts photos based on EXIF info into new directory')
+    parser.add_argument("--skip-duplicates", help="skip source file if same time found in destination, faster but less complete", action="store_true")
+    parser.add_argument("--dry-run", "-d", help="dry run", action="store_true")
+    parser.add_argument("source_dir", help="sorce directory")
+    parser.add_argument("dest_dir", help="destination directory")
+    args = parser.parse_args()
 
-    if tags.has_key('EXIF DateTimeOriginal'):
-        photoDate = str(tags['EXIF DateTimeOriginal'])
-        filePrefix = photoDate[0:4] + photoDate[5:7] + photoDate[8:10]
-    else:
-        filePrefix = None
+    archivist = Archivist(args.dest_dir, args.dry_run, args.skip_duplicates)
 
-    return filePrefix
-
-def DateInfoFromExif(file_name):
-    if file_name == '':
-        return None
-
-    f = open(file_name, 'rb')
-    tags = EXIF.process_file(f, debug=0)
-    #for tag in tags.keys(): #Check tags
-    #    if tag not in ['JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote']:
-    #        #if tag == 'EXIF DateTimeOriginal':
-    #   print "Key: %s; value: %s" % (tag, tags[tag])
-
-    exif = {}
-    if tags.has_key('EXIF DateTimeOriginal'):
-        date_string = str(tags['EXIF DateTimeOriginal'])
-        #print date_string
-        exif['year'] = date_string[0:4]
-        exif['month'] = date_string[5:7]
-        exif['day'] = date_string[8:10]
-        #time = ("%s%s%s" % (date_string[11:13],date_string[14:15],date_string[16:18]))
-        exif['time'] = "%s%s%s" % (date_string[11:13],date_string[14:16],date_string[17:19])
-        return exif
-    else:
-        return None
-
-# compare two files, return true if exif matches
-def cmpExif(src, dst):
-    if src == '' or dst == '':
-        return False
-
-    if not path.exists(src) or not path.exists(dst):
-        return False
-
-    f_src = open(src, 'rb')
-    src_tags = EXIF.process_file(f_src, debug=0)
-    f_src.close()
-    if not src_tags:
-        return False
+    try:
+        archivist.process_directory(args.source_dir)
+    except SourceError as e:
+        print(e)
 
 
-    f_dst = open(dst, 'rb')
-    dst_tags = EXIF.process_file(f_dst, debug=0)
-    f_dst.close()
-    if not dst_tags:
-        return False
-
-    for tag in src_tags.keys(): #Check tags
-        if tag not in ['JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote']:
-            #print "Src Key: %s; value: %s" % (tag, src_tags[tag])
-            #print "Dst Key: %s; value: %s" % (tag, dst_tags[tag])
-            #print "----------------------------------------------"
-            try:
-                src_value = "%s" % src_tags[tag]
-            except TypeError:
-                continue
-
-            if not tag in dst_tags:
-                return False
-            try:
-                dst_value = "%s" % dst_tags[tag]
-            except TypeError:
-                continue
-            if not src_value == dst_value:
-                print "Src Key: %s; value: %s" % (tag, src_tags[tag])
-                print "Dst Key: %s; value: %s" % (tag, dst_tags[tag])
-                #print "Type is %s" % type(src_tags[tag])
-                print "----------------------------------------------"
-                return False
-
-    return True
-
-
-def copyFileExif(src_path, exif, dry_run=False):
-    #dst_path = "%s/%s" % (dst_dir,dst_name)
-    date_dir = "%s/%s/%s" % (dst_dir, exif['year'], exif['month'])
-    if not path.exists(date_dir) and not dry_run:
-        os.makedirs(date_dir)
-
-    dst_fname = "IMG_%s%s%s_%s.jpg" % (exif['year'],exif['month'],exif['day'],exif['time'])
-    dst_path = "%s/%s" % (date_dir, dst_fname)
-    if path.exists(dst_path):
-        if (skip_dups):
-            return 1
-
-        #print "duplicate found at %s (%s)" % (dst_path, src_path)
-        if not cmpExif(src_path, dst_path):
-            n = 1
-            found = False
-            while path.exists(dst_path):
-                dst_fname = "IMG_%s%s%s_%s-%s.jpg" % (exif['year'], exif['month'], exif['day'], exif['time'], n)
-                dst_path = "%s/%s" % (date_dir, dst_fname)
-                n += 1
-
-                if cmpExif(src_path, dst_path):
-                    found = True
-                    break
-
-            if not found:
-                print "copying %s to %s" % (src_path, dst_path)
-                if not dry_run:
-                    shutil.copy(src_path, dst_path)
-                counter['copied'] += 1
-    else:
-        print "copying %s to %s" % (src_path, dst_path)
-        if not dry_run:
-            shutil.copy(src_path, dst_path)
-        counter['copied'] += 1
-
-    return 0
-
-def copyFileToFolder(src_path, fname, folder, dry_run=False):
-    to_folder = "%s/%s" % (dst_dir, folder)
-    if not path.exists(to_folder) and not dry_run:
-        os.makedirs(to_folder)
-
-    dst_path = "%s/%s/%s" % (dst_dir, folder, fname)
-    n = 1
-
-    if path.exists(dst_path):
-        dst_sha1 = sha1File(dst_path)
-        src_sha1 = sha1File(src_path)
-
-        if dst_sha1 == src_sha1:
-            print ("SHA1 match, skipping copy (%s & %s)" % (src_path, dst_path))
-            return 0
-        else:
-
-            while path.exists(dst_path):
-                base, ext = path.splitext(fname)
-                fname = "%s-%s.%s" % (base, n, ext)
-                dst_path = "%s/%s/%s" % (dst_dir, folder, fname)
-                n += 1
-
-    if not dry_run:
-        shutil.copy(src_path, dst_path)
-
-    counter['copied'] += 1
-
-    return 0
-
-
-parser = argparse.ArgumentParser(description='Sorts photos based on EXIF info into new directory')
-parser.add_argument("--src", help="sorce directory", required=True)
-parser.add_argument("--dst", help="destination directory", required=True)
-parser.add_argument("--skip-duplicates", help="skip source file if same time found in destination, faster but less complete", action="store_true")
-parser.add_argument("--dry-run", "-d", help="dry run", action="store_true")
-args = parser.parse_args()
-
-#print args.src
-#print args.dst
-
-# check for source and destination directories
-if path.exists(args.src):
-    if re.match("/$", args.src):
-        src_dir = args.src
-    else:
-        src_dir = "%s/" % args.src
-else:
-    print ("Error: Source directory %s does not exist" % args.src)
-    sys.exit(9)
-
-if path.exists(args.dst):
-    dst_dir = args.dst
-else:
-    print ("Error: Destination directory %s does not exist" % args.dst)
-    sys.exit(9)
-
-if path.abspath(src_dir) == path.abspath(dst_dir):
-    print ("Error: Source and destination directory cannot be the same.")
-    sys.exit(9)
-
-if args.skip_duplicates:
-    print ("Running, skipping duplicates")
-    skip_dups = True
-else:
-    skip_dups = False
-
-dry_run = False
-if args.dry_run:
-    dry_run = True
-
-#os.walk(src_dir)
-for root, dirs, files in os.walk(src_dir):
-
-    for fname in files:
-        base, ext = path.splitext(fname)
-        ext = ext.lower()
-
-        if ext in supported_extentions:
-            #print fname
-            fpath = "%s/%s" % (root, fname)
-            #print fpath
-            exif = DateInfoFromExif(fpath)
-
-            if exif:
-                #print "would copy"
-                copyFileExif(fpath, exif, dry_run=dry_run)
-                counter['exif'] += 1
-            elif re.match('^PANO.*', base):
-                copyFileToFolder(fpath, fname, "Pano", dry_run=dry_run)
-            else:
-                print "Picture has no EXIF data: %s" % fpath
-                copyFileToFolder(fpath, fname, "Unkown", dry_run=dry_run)
-                counter['unknown'] += 1
-
-print "Pictures with exif: %s" % counter['exif']
-print "Pictures copied: %s" % counter['copied']
-print "Pictures w/o exif: %s" % counter['unknown']
+if __name__ == '__main__':
+    main()
